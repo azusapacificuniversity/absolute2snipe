@@ -1,0 +1,377 @@
+#!/bin/python3
+# absolute2snipe - Inventory Import
+#
+# ABOUT:
+#   This program is designed to import inventory information from a
+#   Absolute into Snipe-It using api calls. For more information
+#   about both of these products, please visit their respecitive
+#   websites:
+#       https://absolute.com
+#       https://snipeitapp.com
+#
+# LICENSE:
+#   MIT
+#
+# CONFIGURATION:
+#   These settings are commonly found in the settings.conf file.
+#
+#   You can associate snipe hardware keys in the [api-mapping] section, to to a
+#   Absolute keys so it associates the values into snipe. The default example
+#   associates information that exists by default in both Snipe and Absolute.
+#   The key value is the exact name of the snipe column name.
+#
+#   [api-mapping]
+#     name = systemName
+#     serial = serial
+#     _snipeit_custom_name_1234567890 = publicIpAddress
+#
+#   For more information about generating API credentials please see the products
+#   documentation: www.absolute.com/api - https://snipe-it.readme.io/reference
+
+
+# Import all the things
+import json
+import requests
+import time
+import configparser
+import sys
+import os
+import base64
+import datetime
+import hashlib
+import hmac
+import urllib
+import argparse
+import logging
+
+# Set us up for using runtime arguments by defining them.
+runtimeargs = argparse.ArgumentParser()
+runtimeargs.add_argument("-v", "--verbose", help="Sets the logging level to INFO and gives you a better idea of what the script is doing.", action="store_true")
+runtimeargs.add_argument("--dryrun", help="This checks your config and tries to contact both the Abolute and Snipe-it instances, but exits before updating or syncing any assets.", action="store_true")
+runtimeargs.add_argument("-d", "--debug", help="Sets logging to include additional DEBUG messages.", action="store_true")
+runtimeargs.add_argument("-e", "--existing", help="Will only update assets that already exist and will not create new assets.", action="store_true")
+args = runtimeargs.parse_args()
+
+# Notify users they're going to get a wall of text in verbose mode.
+if args.verbose:
+    logging.basicConfig(level=logging.INFO)
+elif args.debug:
+    logging.basicConfig(level=logging.DEBUG)
+else:
+    logging.basicConfig(level=logging.WARNING)
+
+# Notify users if we're doing a dry run.
+if args.dryrun:
+    print("Dryrun: Starting absolute2snipe with a dry run where no assets will be updated.")
+
+
+# Find a valid settings.conf file.
+logging.info("Searching for a valid settings.conf file.")
+config = configparser.ConfigParser()
+logging.info("Checking for a settings.conf in /opt/absolute2snipe ...")
+config.read("/opt/absolute2snipe/settings.conf")
+if 'snipe-it' not in set(config):
+    logging.info("No valid config found in: /opt Checking for a settings.conf in /etc/absolute2snipe ...")
+    config.read('/etc/absolute2snipe/settings.conf')
+if 'snipe-it' not in set(config):
+    logging.info("No valid config found in /etc Checking for a settings.conf in current directory ...")
+    config.read("settings.conf")
+if 'snipe-it' not in set(config):
+    logging.info("No valid config found in current folder.")
+    logging.error("No valid settings.conf was found. We'll need to quit while you figure out where the settings are at. You can check the README for valid locations.")
+    raise SystemExit("Error: No valid settings.conf - Exiting.")
+
+logging.info("Great, we found a settings file. Let's get started by parsing all of the settings.")
+
+# Set some Variables:
+# This is the address, cname, or FQDN for your Absolute instance.
+absolute_host = config['absolute']['host']
+absolute_region = config['absolute']['region']
+absolute_service = config['absolute']['service']
+absolute_algorithm = config['absolute']['algorithm']
+access_token = config['absolute']['access_token']
+secret_key = config['absolute']['secret_key']
+absolute_filter = config['absolute']['filter']
+# This is the address, cname, or FQDN for your snipe-it instance.
+snipe_base = config['snipe-it']['url']
+apiKey = config['snipe-it']['apiKey']
+snipeheaders = {'Authorization': 'Bearer {}'.format(apiKey),'Accept': 'application/json','Content-Type':'application/json'}
+logging.debug('Request headers for Snipe will be: {}'.format(snipeheaders))
+
+# Exit if there's no token or secret_key set.
+if access_token is None or secret_key is None or access_token is '' or secret_key is '':
+    logging.error('No access key is available to connect to the Absolute API.')
+    raise SystemExit("Setup Error: access_token and/or secret_key are not set properly")
+
+# Exit if there's nothing in the api-mapping section
+count = len(config['api-mapping'])
+if count is 0:
+    logging.error("There are no keys mapped in the api-mapping section of the settings file. You need to set something there.")
+    raise SystemExit("No API-MAPPING Values set")
+
+# Create the request parameters so we don't have to parse it with each request.
+absolute_select_statement = "$select=lastUpdatedUtc"
+for snipekey in config['api-mapping']:
+    absolute_select_statement += ",{}".format(config['api-mapping'][snipekey])
+logging.debug("The Select statement for the request parameters is: {}".format(absolute_select_statement))
+if absolute_filter is None or '':
+    request_parameters = absolute_select_statement
+else:
+    request_parameters = absolute_filter + '&' + absolute_select_statement
+logging.info("The request parameters are: {}".format(request_parameters))
+
+
+### Setup Some Functions ###
+# Function to make the API call for all Absolute devices
+def get_absolute_computers():
+    # Create a date for headers and the credential string
+    t = datetime.datetime.utcnow()
+    absdate = t.strftime('%Y%m%dT%H%M%SZ')
+    datestamp = t.strftime('%Y%m%d') # Date w/o time, used in credential scope
+    method = 'GET'
+    canonical_uri = '/v2/reporting/devices'
+    endpoint = 'https://' + absolute_host + canonical_uri
+    canonical_querystring = urllib.parse.quote(request_parameters, safe='=&')
+    canonical_headers = 'host:' + absolute_host + '\n' + 'content-type:application/json' + '\n' + 'x-abs-date:' + absdate
+    signed_headers = 'host;content-type;x-abs-date'
+    payload_hash = hashlib.sha256(('').encode('utf-8')).hexdigest()
+    canonical_request = method + '\n' + canonical_uri + '\n' + canonical_querystring + '\n' + canonical_headers + '\n' + payload_hash
+    credential_scope = datestamp + '/' + absolute_region + '/' + absolute_service
+    string_to_sign = absolute_algorithm + '\n' +  absdate + '\n' +  credential_scope + '\n' +  hashlib.sha256(canonical_request.encode('utf-8')).hexdigest()
+    signing_key = getSignatureKey(secret_key, datestamp)
+    signature = hmac.new(signing_key, (string_to_sign).encode('utf-8'), hashlib.sha256).hexdigest()
+    authorization_header = absolute_algorithm + ' ' + 'Credential=' + access_token + '/' + credential_scope + ', ' +  'SignedHeaders=' + signed_headers + ', ' + 'Signature=' + signature
+    headers = {'x-abs-date':absdate, 'content-type':'application/json', 'Authorization':authorization_header}
+    request_url = endpoint + '?' + canonical_querystring
+    response = requests.get(request_url, headers=headers)
+    if response.status_code == 200:
+        logging.info("Got back a valid 200 response code.")
+        return response.json()
+    else:
+        logging.warning('Received an invalid status code when trying to retreive Absolute Device list:{} - {}'.format(response.status_code, response.content))
+        logging.info("Returning a null value for the function.")
+        return None
+
+def sign(key, msg):
+    return hmac.new(key, msg.encode('utf-8'), hashlib.sha256).digest()
+
+def getSignatureKey(key, dateStamp):
+    kDate = sign(('ABS1' + key).encode('utf-8'), dateStamp)
+    kSigning = sign(kDate, 'abs1_request')
+    return kSigning
+
+# Function to lookup a snipe asset by serial number or other identifier.
+def search_snipe_asset(serial):
+    api_url = '{}/api/v1/hardware/byserial/{}'.format(snipe_base, serial)
+    response = requests.get(api_url, headers=snipeheaders)
+    if response.status_code == 200:
+        jsonresponse = response.json()
+        # Check to make sure there's actually a result
+        if jsonresponse['total'] == 1:
+            return jsonresponse
+        elif jsonresponse['total'] == 0:
+            logging.info("No assets match {}".format(serial))
+            return "NoMatch"
+        else:
+            logging.warning('FOUND {} matching assets while searching for: {}'.format(jsonresponse['total'], serial))
+            return "MultiMatch"
+    else:
+        logging.warning('Snipe-IT responded with error code:{} when we tried to look up: {}'.format(response, serial))
+        logging.info('{} - {}'.format(response.status_code, response.content))
+        return "ERROR"
+
+# Function to get all the asset models
+def get_snipe_models():
+    api_url = '{}/api/v1/models'.format(snipe_base)
+    logging.debug('Calling against: {}'.format(api_url))
+    response = requests.get(api_url, headers=snipeheaders)
+    if response.status_code == 200:
+        jsonresponse = response.json()
+        logging.debug("Got a valid response that should have {} models.".format(jsonresponse['total']))
+        if jsonresponse['total'] <= len(jsonresponse['rows']) :
+            return jsonresponse
+        else:
+            logging.info("We didn't get enough results so we need to get them again.")
+            api_url = '{}/api/v1/models?limit={}'.format(snipe_base, jsonresponse['total'])
+            newresponse = requests.get(api_url, headers=snipeheaders)
+            if response.status_code == 200:
+                newjsonresponse = newresponse.json()
+                if newjsonresponse['total'] == len(newjsonresponse['rows']) :
+                    return newjsonresponse
+                else:
+                    logging.error("We couldn't seem to get all of the model numbers")
+                    raise SystemExit("Unable to get all model objects from Snipe-IT instanace")
+            else:
+                logging.error('When we tried to retreive a list of models, Snipe-IT responded with error status code:{} - {}'.format(response.status_code, response.content))
+                raise SystemExit("Snipe models API endpoint failed.")
+    else:
+        logging.error('When we tried to retreive a list of models, Snipe-IT responded with error status code:{} - {}'.format(response.status_code, response.content))
+        raise SystemExit("Snipe models API endpoint failed.")
+
+# Function that creates a new Snipe Model - not an asset - with a JSON payload
+def create_snipe_model(payload):
+    api_url = '{}/api/v1/models'.format(snipe_base)
+    logging.debug('Calling to create new snipe model type against: {}\nThe payload for the POST request is:{}\nThe request headers can be found near the start of the output.'.format(api_url, payload))
+    response = requests.post(api_url, headers=snipeheaders, json=payload)
+    if response.status_code == 200:
+        jsonresponse = response.json()
+        modelnumbers[jsonresponse['payload']['model_number']] = jsonresponse['payload']['id']
+        return True
+    else:
+        logging.warning('Error code: {} while trying to create a new model.'.format(response.status_code))
+        return False
+
+# Function to create a new asset by passing array
+def create_snipe_asset(payload):
+    api_url = '{}/api/v1/hardware'.format(snipe_base)
+    logging.debug('Calling to create a new asset against: {}\nThe payload for the POST request is:{}\nThe request headers can be found near the start of the output.'.format(api_url, payload))
+    response = requests.post(api_url, headers=snipeheaders, json=payload)
+    if response.status_code == 200:
+        logging.info("Got back status code: 200 - {}".format(response.content))
+        return "AssetCreated"
+    else:
+        return response
+
+# Function that updates a snipe asset with a JSON payload
+def update_snipe_asset(snipe_id, payload):
+    api_url = '{}/api/v1/hardware/{}'.format(snipe_base, snipe_id)
+    logging.debug('The payload for the snipe update is: {}'.format(payload))
+    response = requests.patch(api_url, headers=snipeheaders, json=payload)
+    # Verify that the payload updated properly.
+    goodupdate = True
+    if response.status_code == 200:
+        logging.debug("Got back status code: 200 - Checking the payload updated properly: If you error here it's because you configure the API mapping right.")
+        jsonresponse = response.json()
+        for key in payload:
+            if jsonresponse['payload'][key] != payload[key]:
+                logging.warning('Unable to update ID: {}. We failed to update the {} field with "{}"'.format(snipe_id, key, payload[key]))
+                goodupdate = False
+            else:
+                logging.info("Sucessfully updated {} with: {}".format(key, payload[key]))
+        return goodupdate
+    else:
+        logging.warning('Whoops. Got an error status code while updating ID {}: {} - {}'.format(snipe_id, response.status_code, response.content))
+        return False
+
+### Run Testing ###
+# Do some tests to see if the hosts are up.
+logging.info("Running tests to see if hosts are up.")
+try:
+    SNIPE_UP = True if requests.get(snipe_base).status_code is 200 else False
+except:
+    SNIPE_UP = False
+try:
+    ABSOLUTE_UP = True if requests.get("https://{}".format(absolute_host)).status_code is 200 or 403 else False
+except:
+    ABSOLUTE_UP = False
+
+if SNIPE_UP is False:
+    logging.error('Snipe-IT looks like it is down from here. \nPlease check your config in the settings.conf file, or your instance.')
+else:
+    logging.info('We were able to get an expected response from your Snipe-IT instance.')
+if ABSOLUTE_UP is False:
+    logging.error('Absolute looks down from here. \nPlease check the your config in the settings.conf file, or your network connection.')
+else:
+    logging.info('We were able to get an expected response from Absolute.')
+
+# Exit if you can't contact SNIPE
+if ( ABSOLUTE_UP == False ) or ( SNIPE_UP == False ):
+    raise SystemExit("Error: Host could not be contacted.")
+
+# Test that we can actually connect with the API keys.
+##TODO Write some more tests here. ha!
+
+logging.info("Finished running our tests.")
+
+
+### Get Started ###
+# Get a list of known models from Snipe
+logging.info("Getting a list of computer models that snipe knows about.")
+snipemodels = get_snipe_models()
+logging.debug("Parsing the {} model results for models with model numbers.".format(len(snipemodels['rows'])))
+modelnumbers = {}
+for model in snipemodels['rows']:
+    if model['model_number'] is "":
+        logging.debug("The model, {}, did not have a model number. Skipping.".format(model['name']))
+        continue
+    modelnumbers[model['model_number']] =  model['id']
+logging.info("Our list of models has {} entries.".format(len(modelnumbers)))
+logging.debug("Here's the list of the {} models and their id's that we were able to collect:\n{}".format(len(modelnumbers), modelnumbers))
+
+# Get the IDS of all active assets.
+absolute_computer_list = get_absolute_computers()
+
+# Make sure we have a good list.
+if absolute_computer_list is not None:
+    TotalNumber = len(absolute_computer_list)
+    logging.info('Received a list of Absolute assets that had {} entries.'.format(TotalNumber))
+    logging.debug(absolute_computer_list)
+else:
+    logging.error("We were not able to retreive a list of assets from your Absolute account. It's likely that your settings, or credentials are incorrect. Check your settings.conf and verify you can make API calls outside of this system with the credentials found in your settings.conf")
+    raise SystemExit("Unable to get Absolute Computers.")
+
+# After this point we start editing data, so quit if this is a dryrun
+if args.dryrun:
+    raise SystemExit("Dryrun: Complete.")
+
+# From this point on, we're editing data.
+logging.info('Starting to Update Inventory')
+CurrentNumber = 0
+
+for absolute_asset in absolute_computer_list:
+    CurrentNumber += 1
+    logging.info("Processing entry {} out of {} - Absolute ID: {} - {}".format(CurrentNumber, TotalNumber, absolute_asset['id'], absolute_asset['serial']))
+    snipe = search_snipe_asset(absolute_asset['serial'])
+    if snipe is 'NoMatch':
+        if args.existing:
+            logging.info('Skipping asset create because of --existing flag')
+            continue
+        ## TODO: Create an asset
+        logging.warning("Sorry, we can't create an asset because it hasn't been built yet. We accept PRs though! Skipping for now.")
+    # Log an error if there's an issue, or more than once match.
+    elif snipe is 'MultiMatch':
+        logging.warning("WARN: You need to resolve multiple assets with the same serial number in your inventory. If you can't find them in your inventory, you might need to purge your deleted records. You can find that in the Snipe Admin settings. Skipping serial number {} for now.".format(absolute_asset['serial']))
+    elif snipe is 'ERROR':
+        logging.error("We got an error when looking up searial number {} in snipe, which shouldn't happen at this point. Check your snipe instance and setup. Skipping for now.".format(absolute_asset['serial']))
+
+    else:
+        snipe_id = snipe['rows'][0]['id']
+        # Only update if Absolute was updated more recently.
+        snipe_time = time.mktime(datetime.datetime.strptime(snipe['rows'][0]['updated_at']['datetime'], "%Y-%m-%d %H:%M:%S").timetuple()) * 1000
+        absolute_time = absolute_asset['lastUpdatedUtc']
+        logging.debug('Absolute {} - Snipe {}'.format(absolute_time, snipe_time))
+        # Check to see that the absolute record is newer than the previous snipe update.
+        if absolute_time > snipe_time:
+            logging.debug('The Absolute asset was updated more recently than the Snipe Asset.')
+            # See if the data needs to be updated or not to help limit the number of API calls to make.
+            for snipekey in config['api-mapping']:
+                absolutekey = config['api-mapping'][snipekey]
+                if "_snipeit_" in snipekey:
+                    logging.debug('This is a custom field so we have to parse it differently.')
+                    custom_snipe_key = "ResetTest"
+                    for custom_field in snipe['rows'][0]['custom_fields']:
+                        logging.debug("Checking Custom Field: {}".format(custom_field))
+                        logging.debug('does {} == {}'.format(snipe['rows'][0]['custom_fields'][custom_field]['field'], snipekey))
+                        if '{}'.format(snipe['rows'][0]['custom_fields'][custom_field]['field']) == '{}'.format(snipekey):
+                            custom_snipe_key = snipe['rows'][0]['custom_fields'][custom_field]['value']
+                    if custom_snipe_key is "ResetTest":
+                        logging.error('The assigned key {} was not assigned to this device type in snipe. Please check your instance and settings.conf'.format(snipekey))
+                        raise SystemExit("Could not associate {} with asset.".format(snipekey))
+                    if absolute_asset[absolutekey] == custom_snipe_key:
+                        logging.debug('The values match, so nothing to update.')
+                    else:
+                        logging.debug("The values don't match, so make an payload.")
+                        payload = {snipekey: custom_snipe_key}
+                        logging.debug('The payload is: {}'.format(payload))
+                        update_snipe_asset(snipe_id, payload)
+                else:
+                    if absolute_asset[absolutekey] == snipe['rows'][0][snipekey]:
+                        logging.debug('The values match, so nothing to update.')
+                    else:
+                        logging.debug("The values don't match, so make an payload.")
+                        payload = {snipekey: absolute_asset[absolutekey]}
+                        logging.debug('The payload is: {}'.format(payload))
+                        update_snipe_asset(snipe_id, payload)
+        else:
+            logging.debug('The Snipe entry was updated more recently, so continue.')
+            continue
